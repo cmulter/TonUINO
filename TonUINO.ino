@@ -80,6 +80,21 @@ void dump_byte_array(byte * buffer, byte bufferSize);
 void adminMenu(bool fromCard = false);
 bool knownCard = false;
 
+static bool hasCard = false;
+
+static byte lastCardUid[4];
+static byte retries;
+static bool lastCardWasUL;
+
+
+const byte PCS_NO_CHANGE     = 0; // no change detected since last pollCard() call
+const byte PCS_NEW_CARD      = 1; // card with new UID detected (had no card or other card before)
+const byte PCS_CARD_GONE     = 2; // card is not reachable anymore
+const byte PCS_CARD_IS_BACK  = 3; // card was gone, and is now back again
+
+byte pollCard();
+void handleCardReader();
+
 // implement a notification class,
 // its member methods will get called
 //
@@ -944,7 +959,6 @@ void playShortCut(uint8_t shortCut) {
 }
 
 void loop() {
-  do {
     checkStandbyAtMillis();
     mp3.loop();
 
@@ -965,7 +979,7 @@ void loop() {
       } while (pauseButton.isPressed() || upButton.isPressed() || downButton.isPressed());
       readButtons();
       adminMenu();
-      break;
+      return;
     }
 
     if (pauseButton.wasReleased()) {
@@ -981,7 +995,7 @@ void loop() {
           mp3.start();
           disablestandbyTimer();
         }
-      ignorePauseButton = false;
+      //ignorePauseButton = false;
     } else if (pauseButton.pressedFor(LONG_PRESS) &&
                ignorePauseButton == false) {
       if (activeModifier != NULL)
@@ -1088,28 +1102,8 @@ void loop() {
     }
 #endif
     // Ende der Buttons
-  } while (!mfrc522.PICC_IsNewCardPresent());
-
-  // RFID Karte wurde aufgelegt
-
-  if (!mfrc522.PICC_ReadCardSerial())
-    return;
-
-  if (readCard(&myCard) == true) {
-    if (myCard.cookie == cardCookie && myCard.nfcFolderSettings.folder != 0 && myCard.nfcFolderSettings.mode != 0) {
-      playFolder();
-    }
-
-    // Neue Karte konfigurieren
-    else if (myCard.cookie != cardCookie) {
-      knownCard = false;
-      mp3.playMp3FolderTrack(300);
-      waitForTrackToFinish();
-      setupCard();
-    }
-  }
-  mfrc522.PICC_HaltA();
-  mfrc522.PCD_StopCrypto1();
+  
+  handleCardReader();
 }
 
 void adminMenu(bool fromCard = false) {
@@ -1779,6 +1773,105 @@ void writeCard(nfcTagObject nfcTag) {
     mp3.playMp3FolderTrack(400);
   Serial.println();
   delay(2000);
+}
+
+void onNewCard()
+{
+  // make random a little bit more "random"
+  randomSeed(millis() + random(1000));
+  if (myCard.cookie == cardCookie && myFolder->folder != 0 && myFolder->mode != 0) {
+    playFolder();
+  }
+  else { 
+    // Neue Karte konfigurieren
+    knownCard = false;
+    setupCard();
+  }
+}
+
+byte pollCard()
+{
+  const byte maxRetries = 2;
+  if (!hasCard)
+  {
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial() && readCard(&myCard))
+    {
+      bool bSameUID = !memcmp(lastCardUid, mfrc522.uid.uidByte, 4);
+      Serial.print(F("IsSameAsLastUID="));
+      Serial.println(bSameUID);
+      // store info about current card
+      memcpy(lastCardUid, mfrc522.uid.uidByte, 4);
+      lastCardWasUL = mfrc522.PICC_GetType(mfrc522.uid.sak) == MFRC522::PICC_TYPE_MIFARE_UL;
+
+      retries = maxRetries;
+      hasCard = true;
+      return bSameUID ? PCS_CARD_IS_BACK : PCS_NEW_CARD;
+    }
+    return PCS_NO_CHANGE;
+  }
+  else // hasCard
+  {
+    // perform a dummy read command just to see whether the card is in range
+    byte buffer[18];
+    byte size = sizeof(buffer);
+
+    if (mfrc522.MIFARE_Read(lastCardWasUL ? 8 : blockAddr, buffer, &size) != MFRC522::STATUS_OK)
+    {
+      if (retries > 0)
+      {
+          retries--;
+      }
+      else
+      {
+          Serial.println(F("card gone"));
+          mfrc522.PICC_HaltA();
+          mfrc522.PCD_StopCrypto1();
+          hasCard = false;
+          return PCS_CARD_GONE;
+      }
+    }
+    else
+    {
+        retries = maxRetries;
+    }
+  }
+  return PCS_NO_CHANGE;
+}
+
+void handleCardReader()
+{
+  // poll card only every 100ms
+  static uint8_t lastCardPoll = 0;
+  uint8_t now = millis();
+
+  if (static_cast<uint8_t>(now - lastCardPoll) > 100)
+  {
+    bool pause = true;
+    if(activeModifier != NULL) {
+        pause = !activeModifier->handlePause();
+    }
+    lastCardPoll = now;
+    switch (pollCard())
+    {
+    case PCS_NEW_CARD:
+      onNewCard();
+      break;
+    case PCS_CARD_GONE:
+      if(pause) {
+        mp3.pause();
+        setstandbyTimer();
+        ignorePauseButton = true;
+      }
+      break;
+    case PCS_CARD_IS_BACK:
+      if(pause) {
+        mp3.start();
+        disablestandbyTimer();
+        ignorePauseButton = false;
+        }
+      break;
+    }    
+  }
 }
 
 
